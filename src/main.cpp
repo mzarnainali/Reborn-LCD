@@ -6,6 +6,7 @@
 // https://rop.nl/truetype2gfx/ custom font online convert tool
 
 // https://funstacklabs.github.io/font-rasteriser.html only number font
+// jgromes/RadioLib@^7.1.2
 
 /*
 Speedo Meter UART data decode
@@ -17,6 +18,8 @@ Temp 33 - 54 = 54-33-1 => 20
 */
 
 #define BLE 0 // SET TO 0 OUT TO REMOVE TRACES
+#define RESET_FLASH 0
+#define DEBUG 0 // SET TO 0 OUT TO REMOVE TRACES
 
 #include <Arduino.h>
 #include "esp_task_wdt.h"
@@ -45,8 +48,6 @@ BLECharacteristic *pStatusCharacteristic;
 #define TIMEOUT_SEC 30
 #define APB_CLK 80000000 // 80 MHz default APB clock
 
-#define DEBUG 1 // SET TO 0 OUT TO REMOVE TRACES
-
 #if DEBUG
 #define D_SerialBegin(...) Serial.begin(__VA_ARGS__);
 #define D_print(...) Serial.print(__VA_ARGS__)
@@ -65,7 +66,9 @@ BLECharacteristic *pStatusCharacteristic;
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-// #include <WebSocketsServer.h>
+// #include <WiFiUdp.h>
+//  #include <WebSocketsServer.h>
+#include <DNSServer.h>
 #include <ArduinoJson.h>
 #include <esp_now.h>
 #include <TFT_eSPI.h>
@@ -98,9 +101,24 @@ BLECharacteristic *pStatusCharacteristic;
 #include <global.h>
 #include <helper.h>
 
+#if RESET_FLASH
+#include "nvs_flash.h"
+void resetFlash()
+{
+  Serial.begin(115200);
+  Serial.println("Trying to erse all NVS flash...");
+  if (nvs_flash_erase() != ESP_OK)
+    Serial.println("===> Error with Flash Erase.");
+  if (nvs_flash_init() != ESP_OK)
+    Serial.println("===> Error with Flash INIT.");
+  Serial.println("Done with NVS flash...");
+  delay(1410065407);
+}
+#endif
+
 void lockDoor();
 void unLockDoor();
-const char *ssid = "Logout";
+// const char *ssid = "Logout";
 int headerHeight = 41;
 String previousInstantAvg = "99.99";
 static String previousInstantAvgInt = "99.99";
@@ -113,8 +131,13 @@ unsigned long last_tpms_id;
 byte last_checksum;
 byte totalTrips = 2;
 byte currentTrip = 0;
+DNSServer dnsServer;
 AsyncWebServer server(80);
+
 AsyncWebSocket webSocket("/ws");
+
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
 // WebSocketsServer webSocket = WebSocketsServer(1337);
 
 int tft_W = 0;
@@ -157,6 +180,11 @@ volatile bool receivedFlag = false;
 uint8_t broadcastAddress[] = {0x48, 0xE7, 0x29, 0x98, 0xB4, 0x1C};
 esp_now_peer_info_t peerInfo;
 void send_page_number(int tripNo, byte buttonState);
+
+bool isOBDServer = false;
+bool isLockByAndriod = false;
+bool isLockByAndriodReboot = false;
+unsigned long lastLockByAndriodTime = 0;
 
 char daysOfTheWeek[7][12] = {"Sunday",
                              "Monday",
@@ -444,6 +472,9 @@ void readSetting()
   D_println(ID_RR);
 
   currentScreen = static_cast<Screen>(storedScreen);
+  isLockByAndriod = preferences.getBool("isLockByAndriod", false);
+  preferences.putBool("isLockByAndriod", false);
+  isLockByAndriodReboot = isLockByAndriod;
   preferences.end();
   // send_page_number(currentTrip, 1);
   D_print("currentScreen: ");
@@ -769,11 +800,15 @@ void unLockDoor()
   if (isMcpOk)
   {
     isDoorLock = false;
+    isLockByAndriod = false;
+    isLockByAndriodReboot = false;
     mcp.digitalWrite(BUTTON_UNLOCK_OUTPUT_PIN, true);
     unLockButtonPressed = true;
     lockUnlockPressedMillis = millis();
   }
 }
+
+
 void printKhudaHafiz()
 {
 
@@ -839,6 +874,8 @@ void processInputPins(int delay)
         currentScreen = DOOR_OPEN_SCREEN;
         resetVariable();
         isDoorLock = false;
+        isLockByAndriod = false;
+        isLockByAndriodReboot = false;
       }
       D_print(" DOOR OPENED => Old Screen: ");
       D_print(previousScreen);
@@ -1625,7 +1662,7 @@ void saveIDs()
   preferences.end();
 }
 
-void startServer(bool isOBD2Server)
+void startServer()
 {
   const char *ssid = "Reborn-LCD";
   const char *password = "Z.12345678";
@@ -1637,6 +1674,9 @@ void startServer(bool isOBD2Server)
   D_println(WiFi.macAddress());
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(ssid, password);
+
+  // DNS server for captive portal
+  dnsServer.start(53, "*", apIP);
 
   /*
   const char *zSsid = "Logout";
@@ -1657,12 +1697,11 @@ void startServer(bool isOBD2Server)
   Serial.println(WiFi.localIP());
 */
   // Route for root / web page
-  server.on("/", HTTP_GET, [isOBD2Server](AsyncWebServerRequest *request)
-            { request->send_P(200, "text/html", (isOBD2Server ? P_OBD_MAIN_PAGE : P_MAIN_PAGE), nullptr); });
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send_P(200, "text/html", (isOBDServer ? P_OBD_MAIN_PAGE : P_MAIN_PAGE), nullptr); });
 
-  server.onNotFound([isOBD2Server](AsyncWebServerRequest *request)
-                    { request->send_P(200, "text/html", (isOBD2Server ? P_OBD_MAIN_PAGE : P_MAIN_PAGE), nullptr); });
-
+  server.onNotFound([](AsyncWebServerRequest *request)
+                    { request->redirect("/"); });
   // Handle form submission
   server.on("/setTime", HTTP_POST, [](AsyncWebServerRequest *request)
             {
@@ -1735,7 +1774,142 @@ void startServer(bool isOBD2Server)
       D_println("update_default");
       request->send(200, "text/html", "OK"); });
 
+  server.on("/lock", HTTP_GET, [](AsyncWebServerRequest *request)
+            { 
+              isLockByAndriod = true;     
+              lastLockByAndriodTime = millis();
+              D_println("lock Door");
+             lockDoor();
+      request->send(200, "text/html", "OK"); });
+
+  server.on("/unlock", HTTP_GET, [](AsyncWebServerRequest *request)
+            {       
+              unLockDoor();
+      D_println("unlock Door");
+      request->send(200, "text/html", "OK"); });
+
   server.begin();
+  D_println("Web server running...");
+}
+
+void setupTelnetServer()
+{
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+  D_println("telnet server running...");
+}
+
+void handleTelnet()
+{
+  if (telnetServer.hasClient())
+  {
+    if (telnetClient && telnetClient.connected())
+      telnetClient.stop();
+
+    telnetClient = telnetServer.available();
+    telnetClient.print("Telnet Client Connected\r\n");
+  }
+
+  if (!telnetClient || !telnetClient.connected())
+    return;
+
+  static char cmd_buffer[64];
+  static uint8_t index = 0;
+
+  while (telnetClient && telnetClient.connected() && telnetClient.available())
+  {
+    char c = telnetClient.read();
+
+    if (c == '\n' || c == '\r')
+    {
+
+      cmd_buffer[index] = '\0';
+      if (index < 3)
+      {
+        index = 0;
+        return;
+      }
+      // remove trailing spaces and hidden chars
+      for (int i = 0; i < index; i++)
+      {
+        if (cmd_buffer[i] < 32 || cmd_buffer[i] > 126)
+        {
+          cmd_buffer[i] = '\0';
+          break;
+        }
+      }
+      index = 0;
+      if (strcmp(cmd_buffer, "reboot") == 0)
+      {
+        telnetClient.println("Rebooting...");
+        delay(1000);
+        ESP.restart();
+      }
+      else if (strcmp(cmd_buffer, "lock") == 0)
+      {
+        isLockByAndriod = true;     
+        lastLockByAndriodTime = millis();
+        lockDoor();
+        telnetClient.println("STATUS: lock");
+      }
+      else if (strcmp(cmd_buffer, "unlock") == 0)
+      {
+        unLockDoor();
+        telnetClient.println("STATUS: unlock");
+      }
+      else if (strcmp(cmd_buffer, "heap") == 0)
+      {
+        uint32_t free_heap = ESP.getFreeHeap();
+        uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        uint32_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+        float frag_index = 1.0 - ((float)largest_block / free_heap);
+
+        telnetClient.println("\n==== ESP32 HEAP STATUS ====");
+
+        telnetClient.printf("Free Heap        : %u bytes\r\n", free_heap);
+        telnetClient.printf("Largest Block    : %u bytes\r\n", largest_block);
+        telnetClient.printf("Internal Free    : %u bytes\r\n", internal_free);
+        telnetClient.printf("PSRAM Free       : %u bytes\r\n", psram_free);
+
+        telnetClient.printf("Fragmentation    : %.2f\r\n", frag_index);
+
+        telnetClient.println("----------------------------");
+
+        if (largest_block < 8000)
+          telnetClient.println("STATUS: WARNING");
+        else if (largest_block < 20000)
+          telnetClient.println("STATUS: OK");
+        else
+          telnetClient.println("STATUS: GOOD");
+
+        telnetClient.println("============================\r\n");
+      }
+
+      else if (strcmp(cmd_buffer, "help") == 0 || strcmp(cmd_buffer, "?") == 0)
+      {
+        telnetClient.println("\r\n==== COMMANDS ====");
+        telnetClient.println("heap");
+        telnetClient.println("reboot");
+        telnetClient.println("lock");
+        telnetClient.println("unlock");
+        telnetClient.println("==================\r\n");
+      }
+      else
+      {
+        telnetClient.print("Unknown command: ");
+        telnetClient.println(cmd_buffer);
+      }
+    }
+    else
+    {
+      if (index < sizeof(cmd_buffer) - 1)
+        cmd_buffer[index++] = c;
+      else
+        index = 0; // overflow protection
+    }
+  }
 }
 
 void click(Button2 &btn)
@@ -2424,6 +2598,17 @@ void handleLatch()
   }*/
 }
 
+void handleLockByAndriod(){
+  if (isLockByAndriod && millis() - lastLockByAndriodTime > 900000) //15 minutes
+  {
+    preferences.begin("zApp", false);
+    preferences.putBool("isLockByAndriod", true);
+    preferences.end();
+    delay(500);
+    ESP.restart();
+  }
+}
+
 static bool isOBD = false;
 void setupOBD()
 {
@@ -2633,8 +2818,6 @@ void startOBD2Sniffing()
 
 int currentSelection = 0; // 0: Start Server, 1: Start OBD2
 bool actionTriggered = false;
-bool isOBDServer = false;
-bool isWebServer = false;
 
 void handelSpecialMode()
 {
@@ -2662,15 +2845,13 @@ void handelSpecialMode()
 
       if (currentSelection == 0)
       {
-        isWebServer = true;
-        startServer(false);
+        isOBDServer = false;
         tft.drawString("Server started.", 50, 50);
       }
       else if (currentSelection == 1)
       {
         isOBDServer = true;
         startOBD2Sniffing();
-        startServer(true);
         tft.drawString("OBD2 started.", 50, 50);
       }
 
@@ -2758,7 +2939,8 @@ void handleCAN_RX()
 
     // Send to WebSocket clients
     webSocket.textAll(output);
-    Serial.println("data sent");
+
+    D_println("data sent");
   }
 }
 
@@ -2854,6 +3036,7 @@ class LockUnlockCallbacks : public BLECharacteristicCallbacks
 // Call this once in setup()
 void initBLE()
 {
+  Serial.println("initBLE()");
   BLEDevice::init("ESP32_BLE_Lock");
   BLEServer *pServer = BLEDevice::createServer();
 
@@ -2892,12 +3075,16 @@ const unsigned long MESSAGE_DELAY = 2; // Expected delay between messages in mil
 
 void setup(void)
 {
+#if RESET_FLASH
+  resetFlash();
+#endif
+
   unsigned long setupStart = millis();
 
   pinMode(LCD_LIGHT_PIN, OUTPUT);
   digitalWrite(LCD_LIGHT_PIN, 0);
   D_SerialBegin(115200);
-  Serial.begin(115200);
+  // Serial.begin(115200);
   delay(100);
   // Serial.setDebugOutput(true);
   D_println("******************** Setup Start *******************");
@@ -2910,7 +3097,15 @@ void setup(void)
   setupWatchDog();
   setupMcp();
   setupPin();
+   if(isLockByAndriod){
+      isDoorLock = true;
+      lastLockByAndriodTime = millis();
+      mcp.digitalWrite(BUTTON_LOCK_OUTPUT_PIN, true);
+      delay(500);
+      mcp.digitalWrite(BUTTON_LOCK_OUTPUT_PIN, false);
+  }
   setupPWM();
+  esp_task_wdt_reset();
   setupButtons();
   setupScreen();
   printPray();
@@ -2925,8 +3120,10 @@ void setup(void)
   resetVariable();
   initPrvLcdData();
   send_page_number(currentTrip, 1);
+  esp_task_wdt_reset();
+  startServer();
+  setupTelnetServer();
   // startMeasurementAHT20();
-
   if (isSpecialMode)
   {
     clearScreen();
@@ -2936,6 +3133,7 @@ void setup(void)
     printLoadingAnimation();
   }
   outputVoltageDAC(1.2);
+
 #if BLE
   initBLE(); // Initialize BLE lock/unlock service
 #endif
@@ -2946,6 +3144,8 @@ void setup(void)
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }*/
   // updateTPMSScreen = true;
+  
+ 
 
   unsigned long setupEnd = millis();
   D_println("***************************************************");
@@ -2962,7 +3162,7 @@ void setup(void)
   //  delay(900000);
   //    isSpecialMode = true;
 }
-
+/*
 const char *messages[] = {
     "0x18DA11F1 [8] <30:0:10:0:0:0:0:0>",
     "0x18DAF111 [8] <21:7D:E0:0:0:0:2D:14>",
@@ -2981,31 +3181,14 @@ const char *messages[] = {
 const int messageCount = sizeof(messages) / sizeof(messages[0]);
 int currentIndex = 0;
 unsigned long lastSendTime = 0;
-
+*/
 void loop()
 {
   // Feed both watchdogs
   esp_task_wdt_reset();
-  // D_println("================================");
   loopStartMillis = millis();
-  /*
-    if (millis() - lastSendTime >= 100)
-    {
-      String output = messages[currentIndex];
-      if (isWebSocketConnected)
-        webSocket.textAll(output + "\n");
-      // Serial.println("Sent: " + output);
 
-      currentIndex++;
-      if (currentIndex >= messageCount)
-      {
-        currentIndex = 0; // Loop back to start
-      }
-
-      lastSendTime = millis();
-    }
-  */
-  if (isSpecialMode)
+  if (isSpecialMode && !isLockByAndriod)
   {
     handelSpecialMode();
     if (isOBDServer)
@@ -3018,23 +3201,29 @@ void loop()
   }
   else
   {
-    btnPlus.loop();
-    btnMinus.loop();
-    processTPMS();
-    processInputPins(300);
-    handleDoorLockUnlock();
-    checkDimLights();
-    checkTemperature(3000);
-    checkCurrentTime(1000);
-    getMeterData(150);
-    checkOBD2Connection();
-    getOBD2Data(5000);
-    printHeader(1000);
-    displayScreen(currentScreen);
-    printCruiseIcon();
-    saveTPMS();
-    handleLatch();
-    setAcSolarValue(10000);
+    dnsServer.processNextRequest();
+    handleTelnet();
+    handleLockByAndriod();
+    //if(!isLockByAndriodReboot){
+     btnPlus.loop();
+     btnMinus.loop();
+     processTPMS();
+     processInputPins(300);
+     handleDoorLockUnlock();
+     checkDimLights();
+     checkTemperature(3000);
+     checkCurrentTime(1000);
+     getMeterData(150);
+     checkOBD2Connection();
+     getOBD2Data(5000);
+     printHeader(1000);
+     displayScreen(currentScreen);
+     printCruiseIcon();
+     saveTPMS();
+     handleLatch();
+     setAcSolarValue(10000);
+    //}
+    
   }
   // D_println("<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>");
   delay(0);
