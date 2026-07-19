@@ -8,6 +8,8 @@
 // https://funstacklabs.github.io/font-rasteriser.html only number font
 // jgromes/RadioLib@^7.1.2
 
+//https://cifertech.github.io/DisplayKit/    online tool to generate code for display, can be used to generate code for static screens like trip screen, can also be used to generate code for icons like lock unlock icons, can also be used to generate code for fonts, but it is not good for that, because it does not support anti-aliasing and it generates code for each character separately, which is not good for memory management, but it can be used to generate code for static screens and icons
+
 /*
 Speedo Meter UART data decode
 *Fuel 1 - 20
@@ -129,7 +131,7 @@ bool isTPMS = false;
 DateTime now;
 unsigned long last_tpms_id;
 byte last_checksum;
-byte totalTrips = 2;
+byte totalTrips = 2; // Mean total trips are 3, because of 0 based index, we are setting it to 2, so that it can go up to 3
 byte currentTrip = 0;
 DNSServer dnsServer;
 AsyncWebServer server(80);
@@ -213,6 +215,10 @@ typedef struct LCD_Data
   int trip_price;
   float speed;
   float outSideTemp;
+  uint16_t rpm;
+  uint16_t inj_timing;
+  float duty_cycle;
+  float inj_freq;
 } LCD_Data;
 
 typedef struct Door_Data
@@ -267,6 +273,10 @@ void initPrvLcdData()
   printedLcdData.trip_price = -1;        // Trip price
   printedLcdData.speed = -1.0f;          // Vehicle speed
   printedLcdData.outSideTemp = -1.0f;
+  printedLcdData.rpm = -1;
+  printedLcdData.inj_timing = -1;
+  printedLcdData.duty_cycle = -1.0f;
+  printedLcdData.inj_freq = -1.0f;
 }
 
 void clearScreen()
@@ -808,7 +818,6 @@ void unLockDoor()
   }
 }
 
-
 void printKhudaHafiz()
 {
 
@@ -1021,6 +1030,7 @@ void processTPMS()
     radio.startReceive();
   }
 }
+
 
 void printDistance(float currentDistance)
 {
@@ -1272,6 +1282,24 @@ void printSpeed(float speed)
     tft.drawString(fractionalPart, 280, 100, 6);
   }
 }
+
+void printRPM(uint16_t rpm)
+{
+   uint16_t val = (rpm > 8000) ? 8000 : rpm;
+
+  if (val != printedLcdData.rpm)
+  {
+    if (val<1000 && printedLcdData.rpm >= 1000)
+    {
+      tft.fillRect(5, 145, 300, 35, TFT_BLACK);
+    }
+    printedLcdData.rpm = val;
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(String(val), 175, 145, 4);
+  }
+}
+
 void showCheckEnginePic()
 {
   drawArrayJpeg(pic_check_engine, sizeof(pic_check_engine), 5, 5);
@@ -1487,6 +1515,21 @@ void printScreenGrid(Screen screen)
     tft.drawString("Trip " + String(currentTrip + 1), 5, 100, 4);
     tft.drawString("km/h", 245, 100, 4);
     tft.drawString("Ltr", 245, 145, 4);
+
+    tft.drawFastHLine(1, 86, tft_W, TFT_WHITE);  // 1st Line
+    tft.drawFastHLine(1, 132, tft_W, TFT_WHITE); // 2nd Line
+    tft.drawFastVLine(120, 40, 140, TFT_WHITE);  // 1st 2nd Title Line
+  }
+  else if (screen == INJECTOR_TIMING_SCREEN)
+  {
+    tft.drawString("Inj Time", 5, 50, 4);
+    tft.drawString("us", 245, 50, 4);
+
+    tft.drawString("Inj Duty", 5, 100, 4);
+    tft.drawString("%", 245, 100, 4);
+
+    //tft.drawString("Inj Freq", 5, 145, 4);
+    tft.drawString("Freq", 245, 145, 4);
 
     tft.drawFastHLine(1, 86, tft_W, TFT_WHITE);  // 1st Line
     tft.drawFastHLine(1, 132, tft_W, TFT_WHITE); // 2nd Line
@@ -1847,7 +1890,7 @@ void handleTelnet()
       }
       else if (strcmp(cmd_buffer, "lock") == 0)
       {
-        isLockByAndriod = true;     
+        isLockByAndriod = true;
         lastLockByAndriodTime = millis();
         lockDoor();
         telnetClient.println("STATUS: lock");
@@ -1922,37 +1965,74 @@ void click(Button2 &btn)
 
     if (btn == btnPlus)
     {
-      // Move to the next screen
-      if (currentScreen == CURRENT_TIME_SCREEN)
+      switch (currentScreen)
       {
+      case CURRENT_TIME_SCREEN:
         currentScreen = TPMS_SCREEN;
         updateTPMSScreen = true;
-      }
-      else if (currentScreen == TPMS_SCREEN)
-      {
+        break;
+
+      case TPMS_SCREEN:
         currentScreen = SPEED_SCREEN;
-      }
-      else if (currentScreen == SPEED_SCREEN)
-      {
+        break;
+
+      case SPEED_SCREEN:
+        currentScreen = INJECTOR_TIMING_SCREEN;
+        break;
+
+      case INJECTOR_TIMING_SCREEN:
         currentScreen = TRIP_SCREEN;
         currentTrip = 0;
         send_page_number(currentTrip, 1);
-      }
-      else if (currentScreen == TRIP_SCREEN && currentTrip >= 0 and currentTrip < totalTrips)
-      {
-        currentTrip++;
-        send_page_number(currentTrip, 1);
-      }
-      else
-      {
+        break;
+
+      case TRIP_SCREEN:
+        if (currentTrip < totalTrips)
+        {
+          currentTrip++;
+          send_page_number(currentTrip, 1);
+        }
+        else
+        {
+          currentScreen = CURRENT_TIME_SCREEN;
+        }
+        break;
+
+      default:
         currentScreen = CURRENT_TIME_SCREEN;
+        break;
       }
     }
-    else if (btn == btnMinus) // Changed from btnPlus to btnMinus
+    else if (btn == btnMinus)
     {
-      // Move to the previous screen
-      if (currentScreen == CURRENT_TIME_SCREEN)
+      switch (currentScreen)
       {
+      case TRIP_SCREEN:
+        if (currentTrip > 0)
+        {
+          currentTrip--;
+          send_page_number(currentTrip, 1);
+        }
+        else
+        {
+          currentScreen = INJECTOR_TIMING_SCREEN;
+        }
+        break;
+
+      case INJECTOR_TIMING_SCREEN:
+        currentScreen = SPEED_SCREEN;
+        break;
+
+      case SPEED_SCREEN:
+        currentScreen = TPMS_SCREEN;
+        updateTPMSScreen = true;
+        break;
+
+      case TPMS_SCREEN:
+        currentScreen = CURRENT_TIME_SCREEN;
+        break;
+
+      case CURRENT_TIME_SCREEN:
         if (totalTrips > 0)
         {
           currentScreen = TRIP_SCREEN;
@@ -1961,31 +2041,10 @@ void click(Button2 &btn)
           send_page_number(currentTrip, 1);
           clearScreenReq = true;
         }
-        else
-        {
-          currentScreen = SPEED_SCREEN;
-        }
-      }
-      else if (currentScreen == TRIP_SCREEN)
-      {
-        if (currentTrip > 0)
-        {
-          currentTrip--;
-          send_page_number(currentTrip, 1);
-        }
-        else
-        {
-          currentScreen = SPEED_SCREEN;
-        }
-      }
-      else if (currentScreen == SPEED_SCREEN)
-      {
-        currentScreen = TPMS_SCREEN;
-        updateTPMSScreen = true;
-      }
-      else if (currentScreen == TPMS_SCREEN)
-      {
-        currentScreen = CURRENT_TIME_SCREEN;
+        break;
+
+      default:
+        break;
       }
     }
     // Save the current page to preferences
@@ -2142,12 +2201,89 @@ void print_Speed_screen()
   if (!updateScreen)
     return;
   printSpeed(lcdData.speed);
+  printRPM(lcdData.rpm);
   printInstantAverage(lcdData.inst_kml, lcdData.inst_lph);
   printGear(lcdData.gear, lcdData.converter_lock);
   printScreenGrid(currentScreen);
 }
-unsigned int text_PSI_color = 0x7BEF;
 
+void print_Injector_Timing_screen()
+{
+  if (!updateScreen)
+    return;
+  
+     //Print Injector Timing in ms
+ if (lcdData.inj_timing != printedLcdData.inj_timing)
+  {
+    if ((lcdData.inj_timing<9999 && printedLcdData.inj_timing >= 9999) || 
+     lcdData.inj_timing == 0)
+    {
+      tft.fillRect(170, 50, 75, 35, TFT_BLACK);
+    }
+
+    printedLcdData.inj_timing = lcdData.inj_timing;
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    if(printedLcdData.inj_timing >0)
+      tft.drawString(String(printedLcdData.inj_timing), 170, 50, 4);
+    else
+      tft.drawString("0000", 170, 50, 4);
+  }
+ 
+  float val = 0;
+  if(!isnanf(lcdData.duty_cycle)){
+    val = lcdData.duty_cycle;
+  }
+  //Print Injector Duty Cycle in percentage
+  if (val != printedLcdData.duty_cycle)
+  {
+    printedLcdData.duty_cycle = val;
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(float2String(printedLcdData.duty_cycle), 170, 100, 4);
+  }
+
+ 
+ 
+  val = 0;
+  if(!isnanf(lcdData.inj_freq)){
+    val = lcdData.inj_freq;
+  }
+  //Print Injector Frequency in Hz
+  if (val != printedLcdData.inj_freq)
+  {
+    if (val<100 && printedLcdData.inj_freq >= 100)
+    {
+      tft.fillRect(170, 145, 75, 35, TFT_BLACK);
+    }
+
+    printedLcdData.inj_freq = val;
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(float2String(printedLcdData.inj_freq), 170, 145, 4);
+    
+    
+    
+  }
+
+  val = 0;
+  if(!isnanf(lcdData.inst_lph)){
+    val = lcdData.inst_lph;
+  }
+
+  //Print Instantaneous Ltr per Hour
+  if (val!= printedLcdData.inst_lph)
+  {
+    tft.setTextDatum(TL_DATUM);
+    printedLcdData.inst_lph = val;
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(float2String(printedLcdData.inst_lph) + " L/h", 5, 145, 4);
+  }
+    
+
+  printInstantAverage(lcdData.inst_kml, lcdData.inst_lph);
+  printGear(lcdData.gear, lcdData.converter_lock);
+  printScreenGrid(currentScreen);
+}
+
+unsigned int text_PSI_color = 0x7BEF;
 void print_TPMS_screen()
 {
   printInstantAverage(lcdData.inst_kml, lcdData.inst_lph);
@@ -2491,6 +2627,9 @@ void displayScreen(Screen screen)
   case SPEED_SCREEN:
     print_Speed_screen();
     break;
+  case INJECTOR_TIMING_SCREEN:
+    print_Injector_Timing_screen();
+    break;
   case TRIP_SCREEN:
     print_trip_screen();
     break;
@@ -2598,8 +2737,9 @@ void handleLatch()
   }*/
 }
 
-void handleLockByAndriod(){
-  if (isLockByAndriod && millis() - lastLockByAndriodTime > 900000) //15 minutes
+void handleLockByAndriod()
+{
+  if (isLockByAndriod && millis() - lastLockByAndriodTime > 900000) // 15 minutes
   {
     preferences.begin("zApp", false);
     preferences.putBool("isLockByAndriod", true);
@@ -2617,6 +2757,7 @@ void setupOBD()
     return;
 
   CAN0.setCANPins((gpio_num_t)CAN_RX_PIN, (gpio_num_t)CAN_TX_PIN);
+  // OBD2.setTimeout(2000);
   isOBD = OBD2.begin();
   if (!isOBD)
   {
@@ -3097,12 +3238,13 @@ void setup(void)
   setupWatchDog();
   setupMcp();
   setupPin();
-   if(isLockByAndriod){
-      isDoorLock = true;
-      lastLockByAndriodTime = millis();
-      mcp.digitalWrite(BUTTON_LOCK_OUTPUT_PIN, true);
-      delay(500);
-      mcp.digitalWrite(BUTTON_LOCK_OUTPUT_PIN, false);
+  if (isLockByAndriod)
+  {
+    isDoorLock = true;
+    lastLockByAndriodTime = millis();
+    mcp.digitalWrite(BUTTON_LOCK_OUTPUT_PIN, true);
+    delay(500);
+    mcp.digitalWrite(BUTTON_LOCK_OUTPUT_PIN, false);
   }
   setupPWM();
   esp_task_wdt_reset();
@@ -3144,8 +3286,6 @@ void setup(void)
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }*/
   // updateTPMSScreen = true;
-  
- 
 
   unsigned long setupEnd = millis();
   D_println("***************************************************");
@@ -3204,26 +3344,25 @@ void loop()
     dnsServer.processNextRequest();
     handleTelnet();
     handleLockByAndriod();
-    //if(!isLockByAndriodReboot){
-     btnPlus.loop();
-     btnMinus.loop();
-     processTPMS();
-     processInputPins(300);
-     handleDoorLockUnlock();
-     checkDimLights();
-     checkTemperature(3000);
-     checkCurrentTime(1000);
-     getMeterData(150);
-     checkOBD2Connection();
-     getOBD2Data(5000);
-     printHeader(1000);
-     displayScreen(currentScreen);
-     printCruiseIcon();
-     saveTPMS();
-     handleLatch();
-     setAcSolarValue(10000);
+    // if(!isLockByAndriodReboot){
+    btnPlus.loop();
+    btnMinus.loop();
+    processTPMS();
+    processInputPins(300);
+    handleDoorLockUnlock();
+    checkDimLights();
+    checkTemperature(3000);
+    checkCurrentTime(1000);
+    getMeterData(150);
+    checkOBD2Connection();
+    getOBD2Data(5000);
+    printHeader(1000);
+    displayScreen(currentScreen);
+    printCruiseIcon();
+    saveTPMS();
+    handleLatch();
+    setAcSolarValue(60000);
     //}
-    
   }
   // D_println("<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>");
   delay(0);

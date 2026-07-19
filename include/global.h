@@ -97,16 +97,18 @@ enum Screen
   TRIP_SCREEN,
   DOOR_OPEN_SCREEN,
   NATIVE_BUTTON_SCREEN,
+  INJECTOR_TIMING_SCREEN,
   TOTAL_SCREENS // This helps in cycling through screens
 };
-
+  
 const char *screenNames[] = {
     "CURRENT_TIME_SCREEN",
     "TPMS_SCREEN",
     "SPEED_SCREEN",
     "TRIP_SCREEN",
     "DOOR_OPEN_SCREEN",
-    "NATIVE_BUTTON_SCREEN"};
+    "NATIVE_BUTTON_SCREEN",
+    "INJECTOR_TIMING_SCREEN"};
 
 byte btnCounter = 0;
 int lowPSI = 20;
