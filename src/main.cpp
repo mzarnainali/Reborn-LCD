@@ -277,6 +277,56 @@ LCD_Data lcdData;
 LCD_Data printedLcdData;
 Door_Data doorData;
 OBD2_DATA OBD2Data;
+Preferences preferences;
+
+
+void clearScreen()
+{
+  // tft.fillScreen(TFT_BLACK);
+  tft.fillRect(0, 42, tft_W, (tft_H - 40), TFT_BLACK);
+}
+// Helper function signature for screen entry handlers
+typedef void (*ScreenHandler)();
+
+// Optional handlers for screens that require special actions on load
+void onTPMSEnter() {
+  updateTPMSScreen = true;
+}
+
+void onTripEnterForward() {
+  currentTrip = 0;
+  send_page_number(currentTrip, 1);
+}
+
+void onTripEnterBackward() {
+  currentTrip = totalTrips;
+  clearScreen();
+  send_page_number(currentTrip, 1);
+  clearScreenReq = true;
+}
+
+// Data structure to represent screen behavior
+struct ScreenConfig {
+  Screen screenId;
+  const char* name;
+  bool hasSubPages;             // Set true for multi-page screens like TRIP
+  ScreenHandler onEnterForward;  // Triggered when entering forward (+)
+  ScreenHandler onEnterBackward; // Triggered when entering backward (-)
+};
+
+// Define menu structure in array sequence order!
+// To insert/remove/reorder screens, simply adjust this list.
+const ScreenConfig screenList[] = {
+  { CURRENT_TIME_SCREEN,    "CURRENT_TIME_SCREEN",    false, nullptr,            nullptr },
+  { TPMS_SCREEN,            "TPMS_SCREEN",            false, onTPMSEnter,        onTPMSEnter },
+  { TRIP_SCREEN,            "TRIP_SCREEN",            true,  onTripEnterForward, onTripEnterBackward },
+  { INJECTOR_TIMING_SCREEN, "INJECTOR_TIMING_SCREEN", false, nullptr,            nullptr },
+  { SPEED_SCREEN,           "SPEED_SCREEN",           false, nullptr,            nullptr }
+};
+
+
+const byte NUM_CONFIGURED_SCREENS = sizeof(screenList) / sizeof(screenList[0]);
+int currentScreenIndex = 0; // Tracks position inside screenList[]
 
 byte doorStatusCmd = 0;
 
@@ -294,7 +344,7 @@ String PreviousTimeString;
 Screen currentScreen = CURRENT_TIME_SCREEN;
 Screen previousScreen = CURRENT_TIME_SCREEN;
 
-Preferences preferences;
+
 
 int countDigits(int number)
 {
@@ -330,11 +380,7 @@ void initPrvLcdData()
   printedLcdData.inj_freq = -1.0f;
 }
 
-void clearScreen()
-{
-  // tft.fillScreen(TFT_BLACK);
-  tft.fillRect(0, 42, tft_W, (tft_H - 40), TFT_BLACK);
-}
+
 template <typename T>
 // Function to draw a vertical gradient rectangle with a split position.
 void drawVerticalGradientRectWithSplit(T &disp, int16_t x, int16_t y, int16_t w, int16_t h,
@@ -2034,6 +2080,71 @@ void click(Button2 &btn)
 {
   if (currentScreen != NATIVE_BUTTON_SCREEN)
   {
+    bool isPlus = (btn == btnPlus);
+
+    if (isPlus)
+    {
+      // Check if current screen handles internal sub-pages (e.g., Trips)
+      if (screenList[currentScreenIndex].hasSubPages && currentTrip < totalTrips)
+      {
+        currentTrip++;
+        send_page_number(currentTrip, 1);
+      }
+      else
+      {
+        // Move to next screen in the array (wraps around automatically)
+        currentScreenIndex = (currentScreenIndex + 1) % NUM_CONFIGURED_SCREENS;
+        currentScreen = screenList[currentScreenIndex].screenId;
+
+        // Execute handler if specified
+        if (screenList[currentScreenIndex].onEnterForward) {
+          screenList[currentScreenIndex].onEnterForward();
+        }
+      }
+    }
+    else // btnMinus
+    {
+      // Check if current screen handles internal sub-pages (e.g., Trips)
+      if (screenList[currentScreenIndex].hasSubPages && currentTrip > 0)
+      {
+        currentTrip--;
+        send_page_number(currentTrip, 1);
+      }
+      else
+      {
+        // Move to previous screen in the array (wraps around automatically)
+        currentScreenIndex = (currentScreenIndex - 1 + NUM_CONFIGURED_SCREENS) % NUM_CONFIGURED_SCREENS;
+        currentScreen = screenList[currentScreenIndex].screenId;
+
+        // Execute handler if specified
+        if (screenList[currentScreenIndex].onEnterBackward) {
+          screenList[currentScreenIndex].onEnterBackward();
+        }
+      }
+    }
+
+    // Save state to NVS preferences
+    preferences.begin("zApp", false);
+    preferences.putInt("currentScreen", static_cast<int>(currentScreen));
+    preferences.putInt("lcdPage", currentScreen);
+    preferences.end();
+    
+    resetVariable();
+
+    // Debug output
+    D_print(isPlus ? "btnPlus pressed " : "btnMinus pressed ");
+    D_print(" => Current Screen: ");
+    D_print(screenList[currentScreenIndex].name);
+    D_print("  Trip #: ");
+    D_println((currentTrip + 1));
+  }
+}
+
+/*
+void click_old(Button2 &btn)
+{
+  if (currentScreen != NATIVE_BUTTON_SCREEN)
+  {
     // Update lcdPage based on button press
 
     // currentScreen = (btn == btnPlus) ? static_cast<Screen>((currentScreen + 1) % TOTAL_SCREENS) : //static_cast<Screen>((currentScreen - 1 + TOTAL_SCREENS) % TOTAL_SCREENS);
@@ -2136,6 +2247,7 @@ void click(Button2 &btn)
     D_println((currentTrip + 1));
   }
 }
+*/
 
 void longClickDetected(Button2 &btn)
 {
