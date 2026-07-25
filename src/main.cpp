@@ -8,7 +8,7 @@
 // https://funstacklabs.github.io/font-rasteriser.html only number font
 // jgromes/RadioLib@^7.1.2
 
-//https://cifertech.github.io/DisplayKit/    online tool to generate code for display, can be used to generate code for static screens like trip screen, can also be used to generate code for icons like lock unlock icons, can also be used to generate code for fonts, but it is not good for that, because it does not support anti-aliasing and it generates code for each character separately, which is not good for memory management, but it can be used to generate code for static screens and icons
+// https://cifertech.github.io/DisplayKit/    online tool to generate code for display, can be used to generate code for static screens like trip screen, can also be used to generate code for icons like lock unlock icons, can also be used to generate code for fonts, but it is not good for that, because it does not support anti-aliasing and it generates code for each character separately, which is not good for memory management, but it can be used to generate code for static screens and icons
 
 /*
 Speedo Meter UART data decode
@@ -16,6 +16,30 @@ Speedo Meter UART data decode
 Temp 33 - 54 = 54-33-1 => 20
        Speed  Fuel*  Temp
 76 42  0      20     54     12 0 0 252 0 0 0 0 0 56 95 161
+
+*/
+
+/*
+  LCD Screen Layout
+
+ (0,0) Top-Left [Ribbon Cable / Pins at Top Edge] ─── (320,0) Top-Right
+    │                                                    │
+    │                                                    │
+    │     ► Your tft.fillRect(5, 145, 300, 35...)        │
+    │       clears a wide bar right here.                │
+    │                                                    │
+(0,240) Bottom-Left ───────────────────────────── (320,240) Bottom-Right
+
+*/
+
+/*
+  ToDo:
+  1. Add average Speed
+  2. show idle time with idle fule in litre
+  3. show remaning fuel in percentage
+  4. show remaning fule cover distance
+
+  5. calculate per dot fuel in litre ans save for calc.
 
 */
 
@@ -70,6 +94,7 @@ BLECharacteristic *pStatusCharacteristic;
 #include <ESPAsyncWebServer.h>
 // #include <WiFiUdp.h>
 //  #include <WebSocketsServer.h>
+// #include <Update.h>
 #include <DNSServer.h>
 #include <ArduinoJson.h>
 #include <esp_now.h>
@@ -118,6 +143,8 @@ void resetFlash()
 }
 #endif
 
+// const char *serverIndex = "<meta name='viewport' content='width=device-width, initial-scale=1.0'><form method='POST' action='#' enctype='multipart/form-data' id='upload_form'>\n    <input type='file' name='update'>\n    <input type='submit' value='Update'>\n</form>\n<div id='prg'>progress: 0%</div>\n<script>\ndocument.getElementById('upload_form').addEventListener('submit', function(e) {\n    e.preventDefault();\n    \n    var form = document.getElementById('upload_form');\n    var data = new FormData(form);\n\n    var xhr = new XMLHttpRequest();\n    xhr.open('POST', '/ota_update', true);\n\n    xhr.upload.addEventListener('progress', function(evt) {\n        if (evt.lengthComputable) {\n            var per = evt.loaded / evt.total;\n            document.getElementById('prg').innerHTML = 'progress: ' + Math.round(per * 100) + '%';\n        }\n    }, false);\n\n    xhr.onload = function() {\n        if (xhr.status === 200) {\n            console.log('success!');\n        }\n    };\n\n    xhr.onerror = function() {\n        // Handle error\n    };\n\n    xhr.send(data);\n});\n</script>";
+
 void lockDoor();
 void unLockDoor();
 // const char *ssid = "Logout";
@@ -126,6 +153,7 @@ String previousInstantAvg = "99.99";
 static String previousInstantAvgInt = "99.99";
 byte previous_kpl_lh = 9;
 String previousRunningTime = "99.99";
+String previousIdleRunningTime = "99.99";
 bool isMcpOk = false;
 bool isTPMS = false;
 DateTime now;
@@ -172,6 +200,11 @@ unsigned long temporaryScreenMillis = 0;
 bool nativeButtonLongClick = false;
 long currentTime = 0;
 float carTemperature = 0, carHumidity = 0;
+int avg_speed = 0;
+unsigned long idleCarRunTimeMs = 0; // Total time spent idle (Speed = 0)
+unsigned long lastUpdateTime = 0;   // Stores the previous timestamp
+float totalMovingTimeMs = 0;        // Total time spent moving (excluding idle)
+float totalDistanceKm = 0;          // Accumulated distance during motion
 // flag to indicate that a packet was received
 volatile bool receivedFlag = false;
 // Return the minimum of two values a and b
@@ -212,13 +245,17 @@ typedef struct LCD_Data
   float trip_distance;
   float trip_avg;
   float trip_fuel;
+  float trip_idle_fuel;
   int trip_price;
   float speed;
+  int avg_speed = 0;
   float outSideTemp;
   uint16_t rpm;
   uint16_t inj_timing;
   float duty_cycle;
   float inj_freq;
+  unsigned long trip_RunTime;
+  unsigned long trip_idle_RunTime;
 } LCD_Data;
 
 typedef struct Door_Data
@@ -258,6 +295,20 @@ Screen currentScreen = CURRENT_TIME_SCREEN;
 Screen previousScreen = CURRENT_TIME_SCREEN;
 
 Preferences preferences;
+
+int countDigits(int number)
+{
+  if (number < 0)
+    number = abs(number); // Handle negative values just in case
+
+  if (number < 10)
+    return 1;
+  if (number < 100)
+    return 2;
+  if (number < 1000)
+    return 3;
+  return 4; // Covers 1000 to 9999 (perfect for Speed and RPM ranges)
+}
 
 void initPrvLcdData()
 {
@@ -547,6 +598,7 @@ void resetVariable()
   previousInstantAvgInt = "99.99";
   previous_kpl_lh = -9;
   previousRunningTime = "99.99";
+  previousIdleRunningTime= "99.99";
   PreviousTimeString = "-";
   initPrvLcdData();
 }
@@ -794,6 +846,8 @@ void setupTPMS()
   }
 }
 
+
+
 void lockDoor()
 {
   if (isMcpOk)
@@ -1031,7 +1085,6 @@ void processTPMS()
   }
 }
 
-
 void printDistance(float currentDistance)
 {
   if (currentDistance != printedLcdData.trip_distance)
@@ -1091,9 +1144,13 @@ void printTripFuel(float _currentTotalFuel)
   }
 }
 
-void calculateEngineRunningTime(float petrol)
+void calculateEngineRunningTime(int delay)
 {
-  if (petrol > 0)
+  static unsigned long _calculateEngineRunningTime = 0;
+  if (millis() - _calculateEngineRunningTime > delay)
+  {
+    _calculateEngineRunningTime = millis();
+  if (lcdData.inst_lph > 0)
   {
     isPetrolZero = false;
     if (!isEngineRunning)
@@ -1102,7 +1159,7 @@ void calculateEngineRunningTime(float petrol)
       engineStartTime = millis();
     }
   }
-  else if (petrol == 0 && isEngineRunning)
+  else if (lcdData.inst_lph == 0 && isEngineRunning)
   {
     if (!isPetrolZero)
     {
@@ -1122,6 +1179,7 @@ void calculateEngineRunningTime(float petrol)
   {
     currentEngineRunTime = millis() - engineStartTime + previousEngineRunTime;
   }
+}
 }
 
 void printFuelPrice(float price)
@@ -1155,7 +1213,7 @@ void printInstantAverage(float inst_kml, float inst_lph)
   {
     val = 0;
   }
-  calculateEngineRunningTime(val);
+ // calculateEngineRunningTime(val);
   String currentInstantAvg = float2String(val);
 
   if (currentInstantAvg != previousInstantAvg)
@@ -1199,7 +1257,17 @@ void printEngineRunningTime()
     previousRunningTime = sVal;
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextDatum(TC_DATUM);              // Centre text on x,y position
-    tft.drawString(sVal, tft_W / 2, 150, 4); // 65
+    tft.drawString(sVal, 80, 150, 4); // 65
+  }
+  //
+
+  sVal = milli2Time(idleCarRunTimeMs);
+  if (sVal != previousIdleRunningTime)
+  {
+    previousIdleRunningTime = sVal;
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);              // Centre text on x,y position
+    tft.drawString(sVal, 245, 150, 4); // 65
   }
 }
 int pox = 0;
@@ -1283,20 +1351,25 @@ void printSpeed(float speed)
   }
 }
 
-void printRPM(uint16_t rpm)
+void printRPM(uint16_t rpm, uint16_t avg_speed)
 {
-   uint16_t val = (rpm > 8000) ? 8000 : rpm;
+  uint16_t val = (rpm > 8000) ? 8000 : rpm;
 
-  if (val != printedLcdData.rpm)
+  if (val != printedLcdData.rpm || avg_speed != printedLcdData.avg_speed)
   {
-    if (val<1000 && printedLcdData.rpm >= 1000)
+    if ((val < 1000 && printedLcdData.rpm >= 1000) ||
+        (countDigits(avg_speed) != countDigits(printedLcdData.avg_speed)))
     {
-      tft.fillRect(5, 145, 300, 35, TFT_BLACK);
+      tft.fillRect(3, 145, 310, 35, TFT_BLACK);
     }
     printedLcdData.rpm = val;
-    tft.setTextDatum(TR_DATUM);
+    printedLcdData.avg_speed = avg_speed;
+    tft.setTextDatum(TC_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(String(val), 175, 145, 4);
+    // tft.drawString(String(val), 175, 145, 4);
+    tft.drawString(String(val), 80, 145, 4);
+    tft.drawString(String(avg_speed), 240, 145, 4);
+    tft.setTextDatum(TR_DATUM);
   }
 }
 
@@ -1528,7 +1601,7 @@ void printScreenGrid(Screen screen)
     tft.drawString("Inj Duty", 5, 100, 4);
     tft.drawString("%", 245, 100, 4);
 
-    //tft.drawString("Inj Freq", 5, 145, 4);
+    // tft.drawString("Inj Freq", 5, 145, 4);
     tft.drawString("Freq", 245, 145, 4);
 
     tft.drawFastHLine(1, 86, tft_W, TFT_WHITE);  // 1st Line
@@ -1830,6 +1903,8 @@ void startServer()
               unLockDoor();
       D_println("unlock Door");
       request->send(200, "text/html", "OK"); });
+
+
 
   server.begin();
   D_println("Web server running...");
@@ -2201,7 +2276,7 @@ void print_Speed_screen()
   if (!updateScreen)
     return;
   printSpeed(lcdData.speed);
-  printRPM(lcdData.rpm);
+  printRPM(lcdData.rpm, avg_speed);
   printInstantAverage(lcdData.inst_kml, lcdData.inst_lph);
   printGear(lcdData.gear, lcdData.converter_lock);
   printScreenGrid(currentScreen);
@@ -2211,29 +2286,30 @@ void print_Injector_Timing_screen()
 {
   if (!updateScreen)
     return;
-  
-     //Print Injector Timing in ms
- if (lcdData.inj_timing != printedLcdData.inj_timing)
+
+  // Print Injector Timing in ms
+  if (lcdData.inj_timing != printedLcdData.inj_timing)
   {
-    if ((lcdData.inj_timing<9999 && printedLcdData.inj_timing >= 9999) || 
-     lcdData.inj_timing == 0)
+    if ((lcdData.inj_timing < 9999 && printedLcdData.inj_timing >= 9999) ||
+        lcdData.inj_timing == 0)
     {
       tft.fillRect(170, 50, 75, 35, TFT_BLACK);
     }
 
     printedLcdData.inj_timing = lcdData.inj_timing;
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    if(printedLcdData.inj_timing >0)
+    if (printedLcdData.inj_timing > 0)
       tft.drawString(String(printedLcdData.inj_timing), 170, 50, 4);
     else
       tft.drawString("0000", 170, 50, 4);
   }
- 
+
   float val = 0;
-  if(!isnanf(lcdData.duty_cycle)){
+  if (!isnanf(lcdData.duty_cycle))
+  {
     val = lcdData.duty_cycle;
   }
-  //Print Injector Duty Cycle in percentage
+  // Print Injector Duty Cycle in percentage
   if (val != printedLcdData.duty_cycle)
   {
     printedLcdData.duty_cycle = val;
@@ -2241,16 +2317,15 @@ void print_Injector_Timing_screen()
     tft.drawString(float2String(printedLcdData.duty_cycle), 170, 100, 4);
   }
 
- 
- 
   val = 0;
-  if(!isnanf(lcdData.inj_freq)){
+  if (!isnanf(lcdData.inj_freq))
+  {
     val = lcdData.inj_freq;
   }
-  //Print Injector Frequency in Hz
+  // Print Injector Frequency in Hz
   if (val != printedLcdData.inj_freq)
   {
-    if (val<100 && printedLcdData.inj_freq >= 100)
+    if (val < 100 && printedLcdData.inj_freq >= 100)
     {
       tft.fillRect(170, 145, 75, 35, TFT_BLACK);
     }
@@ -2258,25 +2333,22 @@ void print_Injector_Timing_screen()
     printedLcdData.inj_freq = val;
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString(float2String(printedLcdData.inj_freq), 170, 145, 4);
-    
-    
-    
   }
 
   val = 0;
-  if(!isnanf(lcdData.inst_lph)){
+  if (!isnanf(lcdData.inst_lph))
+  {
     val = lcdData.inst_lph;
   }
 
-  //Print Instantaneous Ltr per Hour
-  if (val!= printedLcdData.inst_lph)
+  // Print Instantaneous Ltr per Hour
+  if (val != printedLcdData.inst_lph)
   {
     tft.setTextDatum(TL_DATUM);
     printedLcdData.inst_lph = val;
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString(float2String(printedLcdData.inst_lph) + " L/h", 5, 145, 4);
   }
-    
 
   printInstantAverage(lcdData.inst_kml, lcdData.inst_lph);
   printGear(lcdData.gear, lcdData.converter_lock);
@@ -3322,6 +3394,34 @@ const int messageCount = sizeof(messages) / sizeof(messages[0]);
 int currentIndex = 0;
 unsigned long lastSendTime = 0;
 */
+
+
+void calculateAverageSpeed(int delay)
+{
+  static unsigned long lasCalAvgMillis = 0;
+  if (millis() - lasCalAvgMillis > delay)
+  {
+    lasCalAvgMillis = millis();
+    unsigned long timeDelta = currentEngineRunTime - lastUpdateTime;
+    lastUpdateTime = currentEngineRunTime;
+    if (lcdData.speed > 0.0)
+    {
+      totalMovingTimeMs += timeDelta;
+      float timeDeltaHours = timeDelta / 3600000.0;
+      totalDistanceKm += (lcdData.speed * timeDeltaHours);
+      if (totalMovingTimeMs > 0)
+      {
+        float totalMovingHours = totalMovingTimeMs / 3600000.0;
+        avg_speed = totalDistanceKm / totalMovingHours;
+      }
+    }
+    else
+    {
+      idleCarRunTimeMs += timeDelta;
+    }
+  }
+}
+
 void loop()
 {
   // Feed both watchdogs
@@ -3356,6 +3456,8 @@ void loop()
     getMeterData(150);
     checkOBD2Connection();
     getOBD2Data(5000);
+    calculateEngineRunningTime(300);
+    calculateAverageSpeed(300);
     printHeader(1000);
     displayScreen(currentScreen);
     printCruiseIcon();
