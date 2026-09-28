@@ -56,6 +56,14 @@ Temp 33 - 54 = 54-33-1 => 20
 
 #define TYPE_LCD 1
 #define TYPE_DOOR 2
+#define TOTAL_DOTS 20
+#define TOTAL_TANK_CAPACITY 50.0f // Honda Civic 8th Gen capacity
+
+// Structure to hold non-linear calibration profiles
+struct FuelCalibration
+{
+  float dotCapacity[TOTAL_DOTS]; // Liters contained in each specific dot segment (0 to 19)
+};
 
 #if BLE
 #include <BLEDevice.h>
@@ -125,6 +133,7 @@ BLECharacteristic *pStatusCharacteristic;
 
 #include <main_page.h>
 #include <obd_main_page.h>
+#include <fuelDot.h>
 #include <global.h>
 #include <helper.h>
 
@@ -183,6 +192,23 @@ Button2 btnPlus, btnMinus;
 SHT2x sht;
 Adafruit_MCP23X17 mcp;
 
+FuelCalibration fuelProfiles[6]; // 0: Default, 1-5: Analysis Versions
+uint8_t activeFuelProfileIndex = 0;
+
+// Default non-linear curve for Honda Civic 50L tank (Top dots hold more volume)
+const float defaultDotCapacities[TOTAL_DOTS] = {
+    2.5f, 2.5f, 2.5f, 2.5f, 2.5f, // Dots 1-5 (Bottom / Reserve)
+    2.5f, 2.5f, 2.5f, 2.5f, 2.5f, // Dots 6-10
+    2.5f, 2.5f, 2.5f, 2.5f, 2.5f, // Dots 11-15
+    2.5f, 2.5f, 2.5f, 2.5f, 2.5f  // Dots 16-20 (Top dots drop slower)
+};
+;
+
+uint8_t currentDot = 0; // Current raw segment reading (0 to 20)
+uint8_t lastDot = 0;    // Previous raw segment reading
+bool isGostDot = false;
+float fuelUsedInCurrentDot = 0.0f; // Liters consumed within the active dot segment
+
 // HardwareSerial Serial2(2); // Use UART2
 // HardwareSerial Serial3(); // Use UART3
 
@@ -201,10 +227,45 @@ bool nativeButtonLongClick = false;
 long currentTime = 0;
 float carTemperature = 0, carHumidity = 0;
 int avg_speed = 0;
+float remainingFuelPercentage = 0;
+float remainingFuelLiters = 0;
 unsigned long idleCarRunTimeMs = 0; // Total time spent idle (Speed = 0)
 unsigned long lastUpdateTime = 0;   // Stores the previous timestamp
 float totalMovingTimeMs = 0;        // Total time spent moving (excluding idle)
 float totalDistanceKm = 0;          // Accumulated distance during motion
+float shortTermDistanceKM = 0.0f;   // Tracked over short window (e.g., last 15 KM)
+float shortTermFuelLiters = 0.0f;   // Tracked over short window
+float avgKmlForRange = 0.0f;        // Default fallback (Civic average)
+
+const int WINDOW_SIZE_KM = 15; // Track fuel over the last 15 km
+float fuelBuffer[WINDOW_SIZE_KM]; // Circular buffer storing liters per km
+int bufferIndex = 0;
+bool bufferFull = false;
+
+float kmAccumulator = 0.0;    // Tracks distance until 1.0 km is reached
+float fuelAccumulator = 0.0;  // Tracks fuel consumed within the current 1.0 km
+
+float recentAvgKmL = 12.0;    // Default baseline (e.g., 12 km/L) before window fills
+
+// Configuration
+const int WINDOW_SIZE = 15;                 // 15 blocks of 1 km each = 15 km rolling memory
+const float REFILL_THRESHOLD_LITERS = 4.0f; // Min fuel increase to detect a tank refuel
+
+// 15 km Rolling Ring Buffer State
+float blockKmPerLiter[WINDOW_SIZE];
+int blockIndex = 0;
+bool bufferFilled = false;
+float estimatedRangeKm  = 0.0f;
+// Continuous DTE Tracking Markers (Independent of Trip resets)
+float lastDteOdometer = -1.0f;
+float lastDteFuelUsed = -1.0f;
+float prevTankFuelLevel = 0.0f;
+
+// Single-trip tracking state
+int lastTripId = -1;       // -1 means no trip received yet
+float lastDistance = -1.0;
+float lastFuel = -1.0;
+
 // flag to indicate that a packet was received
 volatile bool receivedFlag = false;
 // Return the minimum of two values a and b
@@ -238,24 +299,24 @@ typedef struct LCD_Data
   byte dataType;
   char gear;
   bool converter_lock;
-  float inst_kml;
-  float inst_lph;
+  float inst_kml; // instant Average in KM/H
+  float inst_lph; // instant Fuel Consumption in L/H
   byte totalTrips;
   byte currentTrip;
-  float trip_distance;
-  float trip_avg;
-  float trip_fuel;
-  float trip_idle_fuel;
+  float trip_distance;  // trip distance terevel since reset
+  float trip_avg;       // trip average in km/h since reset
+  float trip_fuel;      // trip toal fuel used in L/h since reset
+  float trip_idle_fuel; // trip fuel used during idle in L/h since reset
   int trip_price;
-  float speed;
-  int avg_speed = 0;
+  float speed;       // Current car speed
+  int avg_speed = 0; // car moving average speed idle time not included  since reset
   float outSideTemp;
-  uint16_t rpm;
+  uint16_t rpm; // Engine RPM
   uint16_t inj_timing;
   float duty_cycle;
   float inj_freq;
-  unsigned long trip_RunTime;
-  unsigned long trip_idle_RunTime;
+  unsigned long trip_RunTime;      // trip total run time in milisecond since reset
+  unsigned long trip_idle_RunTime; // trip idle time in milisecond since reset
 } LCD_Data;
 
 typedef struct Door_Data
@@ -279,7 +340,6 @@ Door_Data doorData;
 OBD2_DATA OBD2Data;
 Preferences preferences;
 
-
 void clearScreen()
 {
   // tft.fillScreen(TFT_BLACK);
@@ -289,27 +349,164 @@ void clearScreen()
 typedef void (*ScreenHandler)();
 
 // Optional handlers for screens that require special actions on load
-void onTPMSEnter() {
+void onTPMSEnter()
+{
   updateTPMSScreen = true;
 }
 
-void onTripEnterForward() {
+void onTripEnterForward()
+{
   currentTrip = 0;
   send_page_number(currentTrip, 1);
 }
 
-void onTripEnterBackward() {
+void onTripEnterBackward()
+{
   currentTrip = totalTrips;
   clearScreen();
   send_page_number(currentTrip, 1);
   clearScreenReq = true;
 }
 
+
+
+
+
+// --- Load Data on ESP32 Startup ---
+void loadTripData() {
+    preferences.begin("zApp", false); // Open namespace "zApp" in Read/Write mode
+
+    bufferIndex = preferences.getInt("bufIdx", 0);
+    bufferFull = preferences.getBool("bufFull", false);
+    recentAvgKmL = preferences.getFloat("avgKmL", 10.0); // Fallback to 10.0 if first boot
+
+    // Load saved 15 km buffer
+    /*
+    for (int i = 0; i < WINDOW_SIZE_KM; i++) {
+        String key = "fBuf" + String(i);
+        fuelBuffer[i] = preferences.getFloat(key.c_str(), 0.1); // Default ~10 km/L (1/10 = 0.1 L/km)
+    }
+        */
+
+    // Retrieve entire array block
+    size_t loadedBytes = preferences.getBytes("fBuf", fuelBuffer, sizeof(fuelBuffer));
+    
+    // If key does not exist yet (first boot), initialize array defaults
+    if (loadedBytes == 0) {
+        for (int i = 0; i < WINDOW_SIZE_KM; i++) {
+            fuelBuffer[i] = 0.1f; // Default ~10 km/L (1 / 10 = 0.1 L/km)
+        }
+    }
+
+    preferences.end();
+    Serial.println("Loaded trip & rolling buffer data from Flash NVS!");
+}
+
+// --- Save Data to ESP32 Flash Memory ---
+void saveTripData() {
+    preferences.begin("zApp", false);
+
+    preferences.putInt("bufIdx", bufferIndex);
+    preferences.putBool("bufFull", bufferFull);
+    preferences.putFloat("avgKmL", recentAvgKmL);
+
+    // Save the entire array in 1 fast binary operation
+    preferences.putBytes("fBuf", fuelBuffer, sizeof(fuelBuffer));
+    
+    // Save active 15 km buffer
+    /*
+    for (int i = 0; i < WINDOW_SIZE_KM; i++) {
+        String key = "fBuf" + String(i);
+        preferences.putFloat(key.c_str(), fuelBuffer[i]);
+    }
+*/
+    preferences.end();
+}
+
+void updateRollingRange(float deltaKm, float deltaFuelLiters, float remainingFuelLiters) {
+   // Serial.printf("Delta Update: Distance %.3f km, Fuel %.3f L, Remaining Fuel %.3f L\n", deltaKm, deltaFuelLiters, remainingFuelLiters); 
+    
+    kmAccumulator += deltaKm;
+    fuelAccumulator += deltaFuelLiters;
+
+    // Process all full kilometers accumulated in this update step
+    while (kmAccumulator >= 1.0) {
+        // Calculate fuel consumed for exactly 1.0 km
+        float fuelForOneKm = fuelAccumulator / kmAccumulator;
+
+        fuelBuffer[bufferIndex] = fuelForOneKm;
+        bufferIndex = (bufferIndex + 1) % WINDOW_SIZE_KM;
+        
+        if (bufferIndex == 0) bufferFull = true;
+
+        // Subtract 1 km and its proportional fuel
+        kmAccumulator -= 1.0;
+        fuelAccumulator -= fuelForOneKm;
+    }
+
+    // --- FIX: Always scan all 15 slots in the window ---
+    // Since fuelBuffer is initialized with defaults (0.083 L/km), 
+    // unwritten slots will naturally act as weighted historical fallback data.
+    int sampleCount = WINDOW_SIZE_KM; 
+    float totalFuelInWindow = 0.0;
+
+    for (int i = 0; i < sampleCount; i++) {
+        totalFuelInWindow += fuelBuffer[i];
+    }
+
+    if (totalFuelInWindow > 0.01) {
+        recentAvgKmL = (float)sampleCount / totalFuelInWindow;
+    }
+
+    // Serial.printf("Rolling Window: Avg Km/L = %.3f, Buffer Index = %d, Buffer Full = %s, Sample Count = %d, totalfuelinwindow: %.3f\n", 
+    //               recentAvgKmL, bufferIndex, bufferFull ? "Yes" : "No", sampleCount, totalFuelInWindow);
+
+    // Calculate DTE Range
+    estimatedRangeKm = remainingFuelLiters * recentAvgKmL;
+}
+
+void processIncomingData(byte tripNumber,float tripDistance,float tripFuel,float remainingFuel) {
+    // 1. Detect if Trip changed, or First Boot, or Trip Reset
+    //Serial.printf("Processing Trip Data: Trip# %d, Distance %.2f km, Fuel %.2f L, Remaining Fuel %.2f L\n", tripNumber, tripDistance, tripFuel, remainingFuel);
+    bool tripChanged = (tripNumber != lastTripId);
+    bool isFirstRun  = (lastDistance < 0.0);
+    bool tripWasReset = (tripDistance < lastDistance);
+
+    if (tripChanged || isFirstRun || tripWasReset) {
+        // Just re-align baselines to the new trip, skip delta calculation for this 1 loop
+        lastTripId   = tripNumber;
+        lastDistance = tripDistance;
+        lastFuel     = tripFuel;
+        return; 
+    }
+	
+    // 2. Normal Delta Calculation for the same trip
+    float deltaKm   = tripDistance - lastDistance;
+    float deltaFuel = tripFuel - lastFuel;
+
+    // Update tracking variables for next 200ms frame
+    lastDistance = tripDistance;
+    lastFuel     = tripFuel;
+
+    // 3. Send valid deltas to the rolling range calculator
+    if (deltaKm > 0.0001 || deltaFuel > 0.0001) {
+        updateRollingRange(deltaKm, deltaFuel, remainingFuel);
+    }
+}
+
+
+
+void beforeShutdown()
+{
+   saveTripData();
+}
+
 // Data structure to represent screen behavior
-struct ScreenConfig {
+struct ScreenConfig
+{
   Screen screenId;
-  const char* name;
-  bool hasSubPages;             // Set true for multi-page screens like TRIP
+  const char *name;
+  bool hasSubPages;              // Set true for multi-page screens like TRIP
   ScreenHandler onEnterForward;  // Triggered when entering forward (+)
   ScreenHandler onEnterBackward; // Triggered when entering backward (-)
 };
@@ -317,13 +514,11 @@ struct ScreenConfig {
 // Define menu structure in array sequence order!
 // To insert/remove/reorder screens, simply adjust this list.
 const ScreenConfig screenList[] = {
-  { CURRENT_TIME_SCREEN,    "CURRENT_TIME_SCREEN",    false, nullptr,            nullptr },
-  { TPMS_SCREEN,            "TPMS_SCREEN",            false, onTPMSEnter,        onTPMSEnter },
-  { TRIP_SCREEN,            "TRIP_SCREEN",            true,  onTripEnterForward, onTripEnterBackward },
-  { INJECTOR_TIMING_SCREEN, "INJECTOR_TIMING_SCREEN", false, nullptr,            nullptr },
-  { SPEED_SCREEN,           "SPEED_SCREEN",           false, nullptr,            nullptr }
-};
-
+    {CURRENT_TIME_SCREEN, "CURRENT_TIME_SCREEN", false, nullptr, nullptr},
+    {TPMS_SCREEN, "TPMS_SCREEN", false, onTPMSEnter, onTPMSEnter},
+    {TRIP_SCREEN, "TRIP_SCREEN", true, onTripEnterForward, onTripEnterBackward},
+    {INJECTOR_TIMING_SCREEN, "INJECTOR_TIMING_SCREEN", false, nullptr, nullptr},
+    {SPEED_SCREEN, "SPEED_SCREEN", false, nullptr, nullptr}};
 
 const byte NUM_CONFIGURED_SCREENS = sizeof(screenList) / sizeof(screenList[0]);
 int currentScreenIndex = 0; // Tracks position inside screenList[]
@@ -344,7 +539,82 @@ String PreviousTimeString;
 Screen currentScreen = CURRENT_TIME_SCREEN;
 Screen previousScreen = CURRENT_TIME_SCREEN;
 
+// Add these public methods inside class FuelManager:
+float getDotCapacity(uint8_t profileIdx, uint8_t dotIdx)
+{
+  if (profileIdx > 5 || dotIdx >= TOTAL_DOTS)
+    return 0.0f;
+  return fuelProfiles[profileIdx].dotCapacity[dotIdx];
+}
 
+void setDotCapacity(uint8_t profileIdx, uint8_t dotIdx, float capacityLiters)
+{
+  if (profileIdx > 5 || dotIdx >= TOTAL_DOTS)
+    return;
+  fuelProfiles[profileIdx].dotCapacity[dotIdx] = capacityLiters;
+}
+
+void saveProfileToNVS(uint8_t profileIdx)
+{
+  if (profileIdx > 5)
+    return;
+  preferences.begin("zApp", false);
+  char key[10];
+  for (int i = 0; i < TOTAL_DOTS; i++)
+  {
+    snprintf(key, sizeof(key), "p%d_%d", profileIdx, i);
+    preferences.putFloat(key, fuelProfiles[profileIdx].dotCapacity[i]);
+  }
+  preferences.end();
+}
+
+void advanceToNextGlobalProfile()
+{
+  preferences.begin("zApp", false);
+  uint8_t currentProfile = preferences.getUChar("global_profile", 1);
+  // Increment profile and wrap around 5 -> 1
+  uint8_t nextProfile = (currentProfile % 5) + 1;
+  preferences.putUChar("global_profile", nextProfile);
+  preferences.end();
+}
+
+void loadProfileFromNVS(uint8_t profileIdx)
+{
+  if (profileIdx > 5)
+    return;
+  preferences.begin("zApp", true);
+  char key[10];
+  for (int i = 0; i < TOTAL_DOTS; i++)
+  {
+    snprintf(key, sizeof(key), "p%d_%d", profileIdx, i);
+    fuelProfiles[profileIdx].dotCapacity[i] = preferences.getFloat(key, 0); // defaultDotCapacities[i]
+  }
+  preferences.end();
+}
+
+float getRemainingFuelLiters();
+// Calculate Distance To Empty (DTE) in KM
+float calculateDistanceToEmpty(float tripAvgKmL, float instantKmL)
+{
+  float remainingLiters = getRemainingFuelLiters();
+
+  // Select best available efficiency figure
+  float effectiveKmL = 0.0f;
+  if (tripAvgKmL > 2.0f)
+  {
+    effectiveKmL = tripAvgKmL; // Use trip average if valid
+  }
+  else if (instantKmL > 2.0f)
+  {
+    effectiveKmL = instantKmL;
+  }
+  else
+  {
+    effectiveKmL = 8.5f; // Fallback city driving average for 1.8L Civic
+  }
+
+  return remainingLiters * effectiveKmL;
+}
 
 int countDigits(int number)
 {
@@ -379,7 +649,6 @@ void initPrvLcdData()
   printedLcdData.duty_cycle = -1.0f;
   printedLcdData.inj_freq = -1.0f;
 }
-
 
 template <typename T>
 // Function to draw a vertical gradient rectangle with a split position.
@@ -566,6 +835,11 @@ void readSetting()
   ID_RL = preferences.getULong("id_rl", ID_RL_DEF);
   ID_RR = preferences.getULong("id_rr", ID_RR_DEF);
 
+  activeFuelProfileIndex = preferences.getUChar("active_prof", 0);
+  currentDot = preferences.getUChar("last_dot", 0);
+  isGostDot = preferences.getBool("isGostDot", false);
+  fuelUsedInCurrentDot = preferences.getFloat("used_dot", 0.0f);
+
   D_print("ID_FL: ");
   D_println(ID_FL);
 
@@ -644,7 +918,7 @@ void resetVariable()
   previousInstantAvgInt = "99.99";
   previous_kpl_lh = -9;
   previousRunningTime = "99.99";
-  previousIdleRunningTime= "99.99";
+  previousIdleRunningTime = "99.99";
   PreviousTimeString = "-";
   initPrvLcdData();
 }
@@ -892,6 +1166,90 @@ void setupTPMS()
   }
 }
 
+void saveFuelState()
+{
+  preferences.begin("zApp", false);
+  preferences.putUChar("last_dot", currentDot);
+  preferences.putFloat("used_dot", fuelUsedInCurrentDot);
+  preferences.putBool("isGostDot", isGostDot);
+  preferences.end();
+}
+
+float getRemainingFuelPercentage()
+{
+  // Tank is completely empty
+  if (currentDot == 0)
+    return 0.0f;
+
+  // 1. Percentage from all full dots below the current active dot (each full dot = 5%)
+  float basePercentage = (currentDot - 1) * 5.0f;
+
+  if (isnan(basePercentage) || basePercentage <= 0.0f)
+  {
+    basePercentage = 0.0f;
+  }
+   
+  // 2. Get active dot capacity (safely handling negative/invalid values)
+  float activeDotCapacity = fuelProfiles[activeFuelProfileIndex].dotCapacity[currentDot - 1];
+  if (isnan(activeDotCapacity) || activeDotCapacity <= 0.0f)
+  {
+    activeDotCapacity = 2.5f;
+  }
+
+  // 3. Calculate remaining fuel in the active segment
+  float remainingInActiveDot = activeDotCapacity - fuelUsedInCurrentDot;
+  if (remainingInActiveDot < 0.0f)
+    remainingInActiveDot = 0.0f;
+
+  // 4. Convert active dot's remaining fuel into a 0.0% to 5.0% fraction
+  float activeDotPercentage = (remainingInActiveDot / activeDotCapacity) * 5.0f;
+
+  if (isnan(activeDotPercentage) || activeDotPercentage <= 0.0f)
+  {
+    activeDotPercentage = 0.0f;
+  }
+
+  // 5. Total fuel percentage
+  float totalPercentage = basePercentage + activeDotPercentage;
+
+  // Clamp between 0.0% and 100.0%
+  if (totalPercentage > 100.0f)
+    totalPercentage = 100.0f;
+  if (totalPercentage < 0.0f)
+    totalPercentage = 0.0f;
+ 
+  return totalPercentage;
+}
+
+// Calculate absolute remaining fuel volume in Liters
+float getRemainingFuelLiters()
+{
+  if (currentDot == 0)
+    return 0.0f;
+
+  float remainingLiters = 0.0f;
+
+  // Sum full capacity of all segments strictly below the active segment
+  for (int i = 0; i < (currentDot - 1); i++)
+  {
+    float cap = fuelProfiles[activeFuelProfileIndex].dotCapacity[i];
+
+    // Safety check: If value is 0, uninitialized (NaN), or invalid, use default curve
+    if (!isnan(cap) && cap > 0.0f)
+    {
+      remainingLiters += cap;
+    }
+  }
+
+  // Add remaining capacity of the current segment
+  float activeDotCapacity = fuelProfiles[activeFuelProfileIndex].dotCapacity[currentDot - 1];
+  float remainingInActiveDot = activeDotCapacity - fuelUsedInCurrentDot;
+  if (remainingInActiveDot < 0.0f)
+    remainingInActiveDot = 0.0f;
+
+  remainingLiters += remainingInActiveDot;
+  return remainingLiters;
+}
 
 
 void lockDoor()
@@ -964,6 +1322,8 @@ void processInputPins(int delay)
       {
         accOffTime = millis(); // Store the time ACC turned OFF
         printKhudaHafiz();
+        saveFuelState();
+        beforeShutdown();
       }
       else
       {
@@ -1196,36 +1556,36 @@ void calculateEngineRunningTime(int delay)
   if (millis() - _calculateEngineRunningTime > delay)
   {
     _calculateEngineRunningTime = millis();
-  if (lcdData.inst_lph > 0)
-  {
-    isPetrolZero = false;
-    if (!isEngineRunning)
+    if (lcdData.inst_lph > 0)
     {
-      isEngineRunning = true;
-      engineStartTime = millis();
+      isPetrolZero = false;
+      if (!isEngineRunning)
+      {
+        isEngineRunning = true;
+        engineStartTime = millis();
+      }
     }
-  }
-  else if (lcdData.inst_lph == 0 && isEngineRunning)
-  {
-    if (!isPetrolZero)
+    else if (lcdData.inst_lph == 0 && isEngineRunning)
     {
-      lastZeroTime = millis();
-      isPetrolZero = true;
+      if (!isPetrolZero)
+      {
+        lastZeroTime = millis();
+        isPetrolZero = true;
+      }
+      else if (millis() - lastZeroTime >= 10000)
+      {
+        // Engine has been stopped for more than 10 seconds
+        isEngineRunning = false;
+        // Calculate total engine running time
+        previousEngineRunTime += millis() - engineStartTime;
+      }
     }
-    else if (millis() - lastZeroTime >= 10000)
-    {
-      // Engine has been stopped for more than 10 seconds
-      isEngineRunning = false;
-      // Calculate total engine running time
-      previousEngineRunTime += millis() - engineStartTime;
-    }
-  }
 
-  if (isEngineRunning)
-  {
-    currentEngineRunTime = millis() - engineStartTime + previousEngineRunTime;
+    if (isEngineRunning)
+    {
+      currentEngineRunTime = millis() - engineStartTime + previousEngineRunTime;
+    }
   }
-}
 }
 
 void printFuelPrice(float price)
@@ -1259,7 +1619,7 @@ void printInstantAverage(float inst_kml, float inst_lph)
   {
     val = 0;
   }
- // calculateEngineRunningTime(val);
+  // calculateEngineRunningTime(val);
   String currentInstantAvg = float2String(val);
 
   if (currentInstantAvg != previousInstantAvg)
@@ -1302,7 +1662,7 @@ void printEngineRunningTime()
   {
     previousRunningTime = sVal;
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextDatum(TC_DATUM);              // Centre text on x,y position
+    tft.setTextDatum(TC_DATUM);       // Centre text on x,y position
     tft.drawString(sVal, 80, 150, 4); // 65
   }
   //
@@ -1312,7 +1672,7 @@ void printEngineRunningTime()
   {
     previousIdleRunningTime = sVal;
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextDatum(TC_DATUM);              // Centre text on x,y position
+    tft.setTextDatum(TC_DATUM);        // Centre text on x,y position
     tft.drawString(sVal, 245, 150, 4); // 65
   }
 }
@@ -1568,24 +1928,59 @@ void printHeader(int delay)
         spriteHeader.drawString(String(humidity, 0) + "%", (xPos + 20), 15, 2);
       }*/
     }
-    if ((cnt / 5) % 2 == 0)
+    /* if ((cnt / 5) % 2 == 0)
+     {
+       spriteHeader.setTextDatum(TL_DATUM);
+       // lastValidFuelLevel = 15;
+       //spriteHeader.drawString(String((lastValidFuelLevel * 5)) + "%", 150, 10, 4);
+       spriteHeader.drawString(String((remainingFuelPercentage)) + "%", 150, 10, 4);
+     }
+     else
+     {
+       spriteHeader.setTextDatum(TL_DATUM);
+       // OBD2Data.EngineTemp1 = 35;
+       if (!isnan(OBD2Data.EngineTemp1))
+       {
+         spriteHeader.drawString(String(OBD2Data.EngineTemp1, 0) + "c", 150, 10, 4);
+       }
+       else
+       {
+         spriteHeader.drawString("?c", 150, 10, 4);
+       }
+     }
+     */
+
+    uint8_t displayMode = (cnt / 3) % 4;
+    spriteHeader.setTextDatum(TC_DATUM);
+    int xpos1 = 165;
+    switch (displayMode)
     {
-      spriteHeader.setTextDatum(TL_DATUM);
-      // lastValidFuelLevel = 15;
-      spriteHeader.drawString(String((lastValidFuelLevel * 5)) + "%", 150, 10, 4);
-    }
-    else
-    {
-      spriteHeader.setTextDatum(TL_DATUM);
-      // OBD2Data.EngineTemp1 = 35;
+    case 0:
+      // 1. Fuel Percentage
+      spriteHeader.drawString(String(remainingFuelPercentage, 0) + "%", xpos1, 10, 4);//150
+      break;
+
+    case 1:
+      // 2. Engine Coolant Temperature
       if (!isnan(OBD2Data.EngineTemp1))
       {
-        spriteHeader.drawString(String(OBD2Data.EngineTemp1, 0) + "c", 150, 10, 4);
+        spriteHeader.drawString(String(OBD2Data.EngineTemp1, 0) + "c", xpos1, 10, 4);
       }
       else
       {
-        spriteHeader.drawString("?c", 150, 10, 4);
+        spriteHeader.drawString("?c", xpos1, 10, 4);
       }
+      break;
+
+    case 2:
+      // 3. Remaining Fuel in Liters
+      spriteHeader.drawString(String(remainingFuelLiters, 1) + "L", xpos1, 10, 4);
+      break;
+
+    case 3:
+      // 4. Remaining Distance / Range
+      spriteHeader.drawString(String(estimatedRangeKm, 0) + "km", xpos1, 10, 4);
+      break;
     }
 
     spriteHeader.setTextDatum(TR_DATUM);
@@ -1843,6 +2238,7 @@ void startServer()
   /*
   const char *zSsid = "Logout";
   const char *zPassword = "ms120400427";
+  WiFi.setAutoReconnect(true);
   WiFi.begin(zSsid, zPassword);
 
   // Wait until connected
@@ -1864,6 +2260,52 @@ void startServer()
 
   server.onNotFound([](AsyncWebServerRequest *request)
                     { request->redirect("/"); });
+
+  server.on("/fuel", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send_P(200, "text/html", FUEL_DOT_HTML); });
+
+  // 2. Fetch Profiles JSON
+  server.on("/api/fuel-profiles", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+        DynamicJsonDocument doc(4096);
+        JsonObject root = doc.to<JsonObject>();
+        JsonArray profilesArr = root.createNestedArray("profiles");
+
+        for (uint8_t p = 0; p < 6; p++) {
+            JsonArray singleProfile = profilesArr.createNestedArray();
+            for (uint8_t d = 0; d < 20; d++) {
+                singleProfile.add(getDotCapacity(p, d));
+            }
+        }
+
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response); });
+
+  // 3. Update Profile 0 POST Handler (Standard ESPAsyncWebServer Method)
+  server.on("/api/save-profile0", HTTP_POST, [](AsyncWebServerRequest *request)
+            {
+              // Response sent after body is processed
+            },
+            NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+        // Parse incoming JSON body
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, data, len);
+
+        if (!error && doc.containsKey("profile0")) {
+            JsonArray p0 = doc["profile0"];
+            if (p0.size() == 20) {
+                for (uint8_t i = 0; i < 20; i++) {
+                    setDotCapacity(0, i, p0[i].as<float>());
+                }
+                saveProfileToNVS(0); // Save to ESP32 Flash Preferences
+                request->send(200, "application/json", "{\"status\":\"ok\"}");
+                return;
+            }
+        }
+        request->send(400, "application/json", "{\"status\":\"invalid data\"}"); });
+
   // Handle form submission
   server.on("/setTime", HTTP_POST, [](AsyncWebServerRequest *request)
             {
@@ -1949,8 +2391,6 @@ void startServer()
               unLockDoor();
       D_println("unlock Door");
       request->send(200, "text/html", "OK"); });
-
-
 
   server.begin();
   D_println("Web server running...");
@@ -2097,7 +2537,8 @@ void click(Button2 &btn)
         currentScreen = screenList[currentScreenIndex].screenId;
 
         // Execute handler if specified
-        if (screenList[currentScreenIndex].onEnterForward) {
+        if (screenList[currentScreenIndex].onEnterForward)
+        {
           screenList[currentScreenIndex].onEnterForward();
         }
       }
@@ -2117,7 +2558,8 @@ void click(Button2 &btn)
         currentScreen = screenList[currentScreenIndex].screenId;
 
         // Execute handler if specified
-        if (screenList[currentScreenIndex].onEnterBackward) {
+        if (screenList[currentScreenIndex].onEnterBackward)
+        {
           screenList[currentScreenIndex].onEnterBackward();
         }
       }
@@ -2128,7 +2570,7 @@ void click(Button2 &btn)
     preferences.putInt("currentScreen", static_cast<int>(currentScreen));
     preferences.putInt("lcdPage", currentScreen);
     preferences.end();
-    
+
     resetVariable();
 
     // Debug output
@@ -2942,7 +3384,9 @@ void setupOBD()
 
   CAN0.setCANPins((gpio_num_t)CAN_RX_PIN, (gpio_num_t)CAN_TX_PIN);
   // OBD2.setTimeout(2000);
+  
   isOBD = OBD2.begin();
+  OBD2.setTimeout(100);
   if (!isOBD)
   {
     D_println("OBD begin failed!");
@@ -3331,6 +3775,37 @@ void setupWatchDog()
   D_println("Both Task WDT and RTC WDT enabled.");
 }
 
+void setupFuelDot()
+{
+
+  preferences.begin("zApp", false);
+
+  // Save default profile to Preferences if not existing
+  if (!preferences.isKey("p0_0"))
+  {
+    // Load or initialize default profile
+    for (int i = 0; i < TOTAL_DOTS; i++)
+    {
+      fuelProfiles[0].dotCapacity[i] = defaultDotCapacities[i];
+    }
+    saveProfileToNVS(0);
+  }
+  else
+  {
+    loadProfileFromNVS(0);
+  }
+
+  // Load remaining profiles (1-5)
+  for (uint8_t p = 1; p <= 5; p++)
+  {
+    loadProfileFromNVS(p);
+  }
+
+  preferences.end();
+
+  D_println("setupFuelDot Done...");
+}
+
 #if BLE
 // BLE callback class
 class LockUnlockCallbacks : public BLECharacteristicCallbacks
@@ -3417,8 +3892,9 @@ void setup(void)
   // Serial2.setRxBufferSize(32);
   Serial2.begin(9600, SERIAL_8N1, 16, -1); // Meter Uart
                                            // Serial.printf("Flash Chip Size: %d bytes\n", ESP.getFlashChipSize());
-  // isSpecialMode = true;                    // ztest
+                                           // isSpecialMode = true;                    // ztest
   readSetting();
+  loadTripData();
   setupWatchDog();
   setupMcp();
   setupPin();
@@ -3435,6 +3911,7 @@ void setup(void)
   setupButtons();
   setupScreen();
   printPray();
+  esp_task_wdt_reset();
   SetupESP_NOW();
   esp_task_wdt_reset();
   setupTPMS();
@@ -3449,6 +3926,9 @@ void setup(void)
   esp_task_wdt_reset();
   startServer();
   setupTelnetServer();
+  esp_task_wdt_reset();
+  setupFuelDot();
+  esp_task_wdt_reset();
   // startMeasurementAHT20();
   if (isSpecialMode)
   {
@@ -3507,7 +3987,6 @@ int currentIndex = 0;
 unsigned long lastSendTime = 0;
 */
 
-
 void calculateAverageSpeed(int delay)
 {
   static unsigned long lasCalAvgMillis = 0;
@@ -3534,13 +4013,171 @@ void calculateAverageSpeed(int delay)
   }
 }
 
+float calculateDistanceDelta(float currentTripDistance)
+{
+  static float lastTripDistance = -1.0f; // Track previous loop's reading
+
+  // First run initialization
+  if (lastTripDistance < 0.0f)
+  {
+    lastTripDistance = currentTripDistance;
+    return 0.0f;
+  }
+
+  // Handle Trip Reset event (when user clears trip counter: current < last)
+  if (currentTripDistance < lastTripDistance)
+  {
+    lastTripDistance = currentTripDistance;
+    return 0.0f;
+  }
+
+  // Calculate distance traveled during this specific loop
+  float deltaKM = currentTripDistance - lastTripDistance;
+
+  // Safety guard against unreasonable spikes (e.g., > 0.2 km in a single loop)
+  if (deltaKM > 0.2f || deltaKM < 0.0f)
+  {
+    deltaKM = 0.0f;
+  }
+  else
+  {
+    lastTripDistance = currentTripDistance; // Store for next iteration
+  }
+
+  return deltaKM;
+}
+
+void calculateRemainingRange(int delay)
+{
+  static unsigned long _calculateRemainingRange = 0;
+  if (millis() - _calculateRemainingRange > delay)
+  {
+    _calculateRemainingRange = millis();
+
+    static float previousTripFuel = 0.0f;
+    static bool isFirstRun = true;
+    static byte lastTripId_forRange   = 255; // Initialize to an invalid trip ID
+    float currentTripFuel = lcdData.trip_fuel;
+
+    // 1. First Startup or Fuel Level Reset
+    if (currentDot == 0)
+    {
+      currentDot = lastValidFuelLevel;
+      lastDot = currentDot;
+      
+      isGostDot = true;
+    }
+
+    // First cycle initialization
+    if (isFirstRun || currentTripFuel < previousTripFuel || lastTripId_forRange != lcdData.currentTrip)
+    {
+      previousTripFuel = currentTripFuel;
+      lastTripId_forRange   = lcdData.currentTrip;
+      isFirstRun = false;
+      return;
+    }
+
+    float fuelConsumedDelta = currentTripFuel - previousTripFuel;
+    previousTripFuel = currentTripFuel;
+
+    // 2. Refill Detection
+    if (lastValidFuelLevel > currentDot)
+    { // Tank filled by 1 or more dots
+      lastDot = currentDot;
+      currentDot = lastValidFuelLevel;
+      fuelUsedInCurrentDot = 0.0f; // Reset intra-dot consumption on refill
+      isGostDot = true;
+      saveFuelState();
+      return;
+    }
+
+    // 2. Dot dropped naturally
+    if (lastValidFuelLevel < currentDot)
+    {
+      lastDot = currentDot;
+      uint8_t emptiedDotIndex = currentDot - 1;
+      currentDot = lastValidFuelLevel;
+
+      if (fuelUsedInCurrentDot > 0)
+      {
+        if (isGostDot)
+          fuelUsedInCurrentDot *= -1;
+        // Save this specific dot value directly to Preferences NVS
+        preferences.begin("zApp", false);
+        // 1. Get the last used history profile index for THIS specific dot (default to 1)
+        uint8_t targetProfile = preferences.getUChar("global_profile", 1);
+
+        // Safety check: ensure target profile stays within 1 to 5
+        if (targetProfile < 1 || targetProfile > 5)
+        {
+          targetProfile = 1;
+        }
+        fuelProfiles[targetProfile].dotCapacity[emptiedDotIndex] = fuelUsedInCurrentDot;
+        char dataKey[10];
+        snprintf(dataKey, sizeof(dataKey), "p%d_%d", targetProfile, emptiedDotIndex);
+       // Serial.printf("Saving fuel used for dot %d in profile %d: %.2f L\n", emptiedDotIndex, targetProfile, fuelUsedInCurrentDot);
+        preferences.putFloat(dataKey, fuelUsedInCurrentDot);
+        preferences.end();
+      }
+      isGostDot = false;
+      fuelUsedInCurrentDot = 0.0f; // Reset intra-dot consumption for new segment
+      saveFuelState();
+    }
+    else
+    {
+      // Calculate consumption delta in Liters since the last reading
+      fuelUsedInCurrentDot += fuelConsumedDelta;
+    }
+    
+
+    remainingFuelLiters = getRemainingFuelLiters();
+    remainingFuelPercentage = getRemainingFuelPercentage();
+    processIncomingData(lcdData.currentTrip, lcdData.trip_distance, lcdData.trip_fuel, remainingFuelLiters);
+    // Serial.printf("Remaining Fuel: %.2f L, Remaining Range: %.2f km, Remaining Fuel Percentage: %.2f%%\n", remainingFuelLiters, estimatedRangeKm, remainingFuelPercentage);
+  }
+}
+
+int vcnt = 0;
+  // Start at maximum range (20 to 0)
+// Function declaration
+void runEverySecond() {
+  static unsigned long previousMillis = 0;
+  const unsigned long interval = 1000; // 1 second in milliseconds
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    vcnt++;
+
+    if(vcnt ==1){
+      lastValidFuelLevel = 20;
+    }
+
+    // --- Task 1: Runs every 1 second ---
+    lcdData.trip_fuel += 0.5;     // Fuel in liters
+    lcdData.trip_distance += 5.0; // Distance in km
+
+    // --- Task 2: Decreases lastValidFuelLevel every 5 seconds ---
+    if ((vcnt / 5) % 2 == 0){
+      if (lastValidFuelLevel > 0) {
+        lastValidFuelLevel--; // Decrements by 1 (20, 19, 18 ... 0)
+      }
+      
+      // Serial.printf("Trip Fuel: %.2f L, Trip Distance: %.2f km, Fuel Level: %d\n", lcdData.trip_fuel, lcdData.trip_distance, lastValidFuelLevel);
+
+    }
+  }
+}
+
 void loop()
 {
+ //runEverySecond();
   // Feed both watchdogs
   esp_task_wdt_reset();
   loopStartMillis = millis();
 
-  if (isSpecialMode && !isLockByAndriod)
+  if (isSpecialMode && !isLockByAndriod )//ztest
   {
     handelSpecialMode();
     if (isOBDServer)
@@ -3556,7 +4193,7 @@ void loop()
     dnsServer.processNextRequest();
     handleTelnet();
     handleLockByAndriod();
-    // if(!isLockByAndriodReboot){
+    //if(!isLockByAndriodReboot){
     btnPlus.loop();
     btnMinus.loop();
     processTPMS();
@@ -3568,8 +4205,9 @@ void loop()
     getMeterData(150);
     checkOBD2Connection();
     getOBD2Data(5000);
-    calculateEngineRunningTime(300);
-    calculateAverageSpeed(300);
+    calculateEngineRunningTime(1000);
+    calculateAverageSpeed(1000);
+    calculateRemainingRange(1000);
     printHeader(1000);
     displayScreen(currentScreen);
     printCruiseIcon();

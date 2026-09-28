@@ -352,7 +352,7 @@ int OBD2Class::begin()
     // next try extended addressing
     _useExtendedAddressing = true;
     //CAN0.watchFor(0x18daf110);
-	CAN0.watchFor(0x18DAF111);
+	  CAN0.watchFor(0x18DAF111);
 
     if (!supportedPidsRead()) {
       return 0;

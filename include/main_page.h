@@ -7,6 +7,7 @@ const char P_MAIN_PAGE[] PROGMEM = R"rawliteral(
 
   </head>
   <body>
+  <a href="/fuel"> Fuel Calibration </a>
     <h1>TPMS ID Configuration</h1>
 
     <label for="id_fl">ID_FL:

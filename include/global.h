@@ -11,9 +11,9 @@
 #define ID_RR 0x1D500EUL*/
 
 #define ID_FL_DEF 0x1F9E17UL
-#define ID_FR_DEF 0x1D2C01UL
+#define ID_FR_DEF 0x1D500EUL
 #define ID_RL_DEF 0x1FAA50UL
-#define ID_RR_DEF 0x1D500EUL
+#define ID_RR_DEF 0x1D2C01UL 
 
 // Default IDs
 uint32_t ID_FL ;
